@@ -45,6 +45,12 @@ BASE_URL = "https://8.28.72.57/api/sp"
 RDAP_BASE = "https://www.rdap.net/ip"
 TOP_N_SOURCES = 10
 
+# Paste your Sightline API token here to skip the prompt each run.
+# Leave as "" to be prompted (hidden input) instead. Note: if you fill
+# this in, the token sits in this file in plain text -- fine for a
+# personal/local copy, but don't commit or share the file with it set.
+API_TOKEN = ""
+
 HIGHLY_DISTRIBUTED_IP = "0.0.0.0"
 HIGHLY_DISTRIBUTED_LABEL = "Highly Distributed"
 
@@ -74,6 +80,8 @@ def get_alert_id():
 
 
 def get_token():
+    if API_TOKEN:
+        return API_TOKEN
     token = getpass.getpass("Sightline API token (input hidden): ").strip()
     if not token:
         sys.exit("ERROR: No token entered.")
