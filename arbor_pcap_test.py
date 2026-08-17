@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Arbor Sightline TMS Packet Capture -- LIMITED TEST SCRIPT
+Arbor Sightline TMS Packet Capture -- LIMITED TEST SCRIPT - quick test edit
 
 This is a test/tuning version only. It:
   1. Enumerates all TMS devices carrying traffic for the mitigation.
