@@ -17,9 +17,12 @@ Given an alert number, this script:
      for each of the top 10 sources -- skipped for any source Arbor
      reports as 0.0.0.0, which is displayed as "Highly Distributed"
      instead of a real IP.
-  5. Prints a single-page summary: alert info, then one table with
-     source, protocol, ports, max bps/pps, destination, and RDAP org
-     name per row.
+  5. Fetches the "Total Traffic" timeseries from
+     /alerts/<id>/traffic/misuse_types/ and renders it as a small
+     inline text graph next to the alert header.
+  6. Prints a single-page summary: alert info (with the traffic graph
+     alongside it), then one table with source, protocol, ports, max
+     bps/pps, destination, and RDAP org name per row.
 
 Usage:
     python3 arbor_alert_lookup.py <alert_number>
@@ -34,7 +37,7 @@ stored).
 import getpass
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import requests
 import urllib3
@@ -132,6 +135,89 @@ def get_alert_basic_info(session, alert_id):
         "severity_unit": subobj.get("severity_unit"),
         "ip_version": subobj.get("ip_version"),
     }
+
+
+def _normalize_query_view(impact_boundary):
+    """
+    Maps the alert's impact_boundary (e.g. 'managed object', 'network',
+    'router') to the query_view value the API expects (which uses
+    underscores, e.g. 'managed_object'). Returns None if there's
+    nothing usable to map (e.g. 'router', which additionally needs a
+    view_router_id we don't have -- safer to not force a view we can't
+    fully specify than to send a request that will just fail).
+    """
+    if not impact_boundary:
+        return None
+    boundary = impact_boundary.strip().lower()
+    if boundary == "network":
+        return "network"
+    if boundary in ("managed object", "managed_object"):
+        return "managed_object"
+    # "router" is intentionally excluded -- query_view=router requires
+    # view_router_id, which would need a separate lookup to get right.
+    return None
+
+
+def get_total_traffic_timeseries(session, alert_id, unit, impact_boundary=None):
+    """
+    Fetches /alerts/<id>/traffic/misuse_types/ and pulls out just the
+    "Total Traffic" entry (the same "all alert traffic" curve shown in
+    the Sightline UI's alert traffic graph), including its real
+    timeseries array.
+
+    IMPORTANT: this endpoint's documented default query_view is
+    "network" for every alert type, regardless of where the alert was
+    actually measured (impact_boundary). If the alert's traffic was
+    actually measured at a managed_object or router boundary, the
+    network view can come back with no data at all. So this function
+    explicitly sets query_view based on impact_boundary rather than
+    relying on the endpoint's default.
+
+    Returns (traffic_data, debug_info):
+        traffic_data -- dict {timeseries_start, step, timeseries},
+                         or None if unavailable.
+        debug_info   -- dict explaining what was found/not found, so
+                         callers can report *why* there's no graph
+                         instead of just silently having none.
+    """
+    url = f"{BASE_URL}/alerts/{alert_id}/traffic/misuse_types/"
+    query_view = _normalize_query_view(impact_boundary)
+    params = {"query_unit": unit, "query_limit": 20}
+    if query_view:
+        params["query_view"] = query_view
+    resp = session.get(url, params=params, verify=False, timeout=30)
+
+    if resp.status_code == 404:
+        return None, {"reason": "endpoint returned 404 (not found for this alert)",
+                      "query_view_used": query_view or "(endpoint default: network)"}
+    resp.raise_for_status()
+
+    entries = resp.json().get("data", [])
+    names_found = []
+    for entry in entries:
+        view = entry.get("attributes", {}).get("view", {})
+        if not view:
+            continue
+        view_data = next(iter(view.values()), {})
+        unit_data = view_data.get("unit", {}).get(unit, {})
+        name = unit_data.get("name")
+        if name:
+            names_found.append(name)
+        if name == "Total Traffic":
+            timeseries = unit_data.get("timeseries") or []
+            if not timeseries:
+                return None, {"reason": "'Total Traffic' entry found but its timeseries array is empty",
+                              "names_found": names_found,
+                              "query_view_used": query_view or "(endpoint default: network)"}
+            return {
+                "timeseries_start": unit_data.get("timeseries_start"),
+                "step": unit_data.get("step") or 60,
+                "timeseries": timeseries,
+            }, {"reason": "found and used", "query_view_used": query_view or "(endpoint default: network)"}
+    return None, {"reason": "no 'Total Traffic' entry in response",
+                  "names_found": names_found,
+                  "query_view_used": query_view or "(endpoint default: network)",
+                  "num_entries": len(entries)}
 
 
 def _pattern_key(fields):
@@ -394,6 +480,107 @@ def rdap_lookup(ip_address, retries=2, timeout=15):
 # Formatting
 # --------------------------------------------------------------------------
 
+def _downsample_max(values, target_buckets):
+    """
+    Compresses a timeseries down to at most target_buckets points by
+    taking the max within each bucket, so peaks aren't smoothed away
+    just to fit a small graph.
+    """
+    n = len(values)
+    if n <= target_buckets:
+        return values
+    bucket_size = n / target_buckets
+    buckets = []
+    for i in range(target_buckets):
+        start = int(i * bucket_size)
+        end = max(int((i + 1) * bucket_size), start + 1)
+        chunk = values[start:end]
+        buckets.append(max(chunk) if chunk else 0)
+    return buckets
+
+
+# 9 fill levels per character cell (0=empty ... 8=full), used to give
+# each row of the graph finer-than-one-row vertical resolution.
+_BLOCK_LEVELS = " ▁▂▃▄▅▆▇█"
+
+
+def _render_bar_column(value, max_value, num_rows):
+    """
+    Returns a list of num_rows characters (top row first) representing
+    a single column of a bottom-up bar, where the bar's height (out of
+    num_rows * 8 sub-levels) is proportional to value/max_value.
+    """
+    frac = 0 if max_value <= 0 else max(0, min(1, value / max_value))
+    total_levels = num_rows * 8
+    filled = round(frac * total_levels)
+
+    bottom_up = []
+    remaining = filled
+    for _ in range(num_rows):
+        level = min(8, remaining)
+        bottom_up.append(level)
+        remaining -= level
+
+    return [_BLOCK_LEVELS[lvl] for lvl in reversed(bottom_up)]
+
+
+GRAPH_NUM_ROWS = 3
+GRAPH_NUM_COLS = 20
+
+
+def build_traffic_graph_lines(traffic_data, unit):
+    """
+    Builds the small "Traffic Graph" as a list of exactly 6 text lines
+    (header, then 3 bar rows, then a dedicated dotted-baseline row,
+    then x-axis timestamps), meant to sit to the right of the alert
+    info block. No scale labels -- just the shape of the traffic over
+    the alert's duration. Returns [] if there's no usable data, so
+    callers can just skip attaching a graph entirely.
+    """
+    if not traffic_data or not traffic_data.get("timeseries"):
+        return []
+
+    raw_values = traffic_data["timeseries"]
+    step = traffic_data.get("step") or 60
+    start_dt = _parse_iso(traffic_data.get("timeseries_start"))
+
+    values = _downsample_max(raw_values, GRAPH_NUM_COLS)
+    max_value = max(values) if values else 0
+    if max_value <= 0:
+        return []
+
+    columns = [_render_bar_column(v, max_value, GRAPH_NUM_ROWS) for v in values]
+    rows = ["".join(col[r] for col in columns) for r in range(GRAPH_NUM_ROWS)]
+
+    # A dedicated row below the bars marking near-zero columns with a
+    # dot, so "quiet" reads clearly as its own line rather than being
+    # crammed into the bottom bar row.
+    NEAR_ZERO_FRACTION = 0.02
+    baseline_row = "".join(
+        "\u00b7" if v <= max_value * NEAR_ZERO_FRACTION else " "
+        for v in values
+    )
+
+    label_unit = "PPS" if unit == "pps" else "BPS"
+
+    lines = [f"Traffic Graph ({label_unit})"]
+    lines.extend(rows)
+    lines.append(baseline_row)
+
+    chart_width = len(rows[0])
+    if start_dt:
+        end_dt = start_dt + timedelta(seconds=step * (len(raw_values) - 1))
+        start_label = start_dt.strftime("%H:%M")
+        end_label = end_dt.strftime("%H:%M")
+        gap = max(1, chart_width - len(start_label) - len(end_label))
+        axis = start_label + (" " * gap) + end_label
+    else:
+        axis = ""
+    lines.append(axis)
+
+    return lines
+
+
 def format_bps(bps):
     if bps is None:
         return "N/A"
@@ -416,31 +603,46 @@ def format_pps(pps):
     return f"{pps:.0f} pps"
 
 
-def print_basic_info(info, sort_unit, sort_confident):
+GRAPH_LEFT_MARGIN = 84
+
+
+def print_basic_info(info, sort_unit, sort_confident, graph_lines=None):
+    graph_lines = graph_lines or []
     print("\n" + "=" * 120)
     print(f"ALERT {info['alert_id']}")
     print("=" * 120)
     importance_map = {0: "Low", 1: "Medium", 2: "High"}
     imp = info["importance"]
-    print(_cell(f"  Type:            {info['alert_type']} ({info['alert_class']})", 48) +
-          f"Classification: {info['classification']}")
-    print(_cell(f"  Importance:      {imp} ({importance_map.get(imp, 'unknown')})", 48) +
-          f"Ongoing: {info['ongoing']}")
-    print(_cell(f"  Start:           {info['start_time']}", 48) +
-          f"Stop: {info['stop_time'] or '(still ongoing)'}")
+
+    left_lines = []
+    left_lines.append(_cell(f"  Type:            {info['alert_type']} ({info['alert_class']})", 48) +
+                       f"Classification: {info['classification']}")
+    left_lines.append(_cell(f"  Importance:      {imp} ({importance_map.get(imp, 'unknown')})", 48) +
+                       f"Ongoing: {info['ongoing']}")
+    left_lines.append(_cell(f"  Start:           {info['start_time']}", 48) +
+                       f"Stop: {info['stop_time'] or '(still ongoing)'}")
     if info["host_address"]:
-        print(_cell(f"  Host address:    {info['host_address']}", 48) +
-              f"Duration: {format_duration(info['start_time'], info['stop_time'])}")
+        left_lines.append(_cell(f"  Host address:    {info['host_address']}", 48) +
+                           f"Duration: {format_duration(info['start_time'], info['stop_time'])}")
     else:
-        print(f"  Duration:        {format_duration(info['start_time'], info['stop_time'])}")
+        left_lines.append(f"  Duration:        {format_duration(info['start_time'], info['stop_time'])}")
     misuse = ", ".join(info["misuse_types"]) if info["misuse_types"] else "N/A"
-    print(_cell(f"  Impact:          {format_bps(info['impact_bps'])} / {format_pps(info['impact_pps'])}", 48) +
-          f"Misuse types: {misuse}")
+    left_lines.append(_cell(f"  Impact:          {format_bps(info['impact_bps'])} / {format_pps(info['impact_pps'])}", 48) +
+                       f"Misuse types: {misuse}")
     if info["severity_percent"] is not None:
-        print(f"  Severity:        {info['severity_percent']}% of {info['severity_threshold']} {info['severity_unit']} threshold")
+        left_lines.append(f"  Severity:        {info['severity_percent']}% of {info['severity_threshold']} {info['severity_unit']} threshold")
+    else:
+        left_lines.append("  Severity:        N/A")
     label = sort_unit.upper() if sort_confident else f"{sort_unit.upper()} (default -- trigger unit unrecognized)"
-    print(_cell(f"  Sorted by:       {label} (alert trigger)", 48) +
-          f"Alert source: {info['impact_boundary'] or 'N/A'}")
+    left_lines.append(_cell(f"  Sorted by:       {label} (alert trigger)", 48) +
+                       f"Alert source: {info['impact_boundary'] or 'N/A'}")
+
+    for i, line in enumerate(left_lines):
+        graph_part = graph_lines[i] if i < len(graph_lines) else ""
+        if graph_part:
+            print(_cell(line, GRAPH_LEFT_MARGIN) + graph_part)
+        else:
+            print(line)
     print()
 
 
@@ -568,16 +770,25 @@ def main():
     print(f"\nLooking up alert {alert_id}...")
     basic_info = get_alert_basic_info(session, alert_id)
     sort_unit, sort_confident = determine_sort_unit(basic_info)
-    print_basic_info(basic_info, sort_unit, sort_confident)
 
-    print("Fetching traffic patterns...")
+    traffic_data, traffic_debug = get_total_traffic_timeseries(
+        session, alert_id, sort_unit, impact_boundary=basic_info.get("impact_boundary")
+    )
+    graph_lines = build_traffic_graph_lines(traffic_data, sort_unit)
+    if not graph_lines:
+        print(f"(No traffic graph shown -- {traffic_debug['reason']}"
+              f"; query_view used: {traffic_debug.get('query_view_used')}"
+              + (f"; misuse types found: {traffic_debug['names_found']}" if traffic_debug.get("names_found") else "")
+              + ")")
+
+    print_basic_info(basic_info, sort_unit, sort_confident, graph_lines)
+
+    print("Loading traffic patterns...")
     patterns = get_traffic_patterns(session, alert_id, query_limit=50, sort_unit=sort_unit)
 
-    print(f"Deriving top {TOP_N_SOURCES} sources from traffic patterns...")
     top_sources = top_sources_from_patterns(patterns, TOP_N_SOURCES, sort_unit=sort_unit)
 
     lookup_targets = [s for s in top_sources if not is_highly_distributed(s["src_prefix"])]
-    print(f"Running RDAP lookups for {len(lookup_targets)} source(s) via rdap.net...")
     rdap_by_ip = {}
     for s in lookup_targets:
         ip = strip_prefix_length(s["src_prefix"])
