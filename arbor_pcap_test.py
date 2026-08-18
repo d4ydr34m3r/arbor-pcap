@@ -62,7 +62,6 @@ def get_args():
 
 def get_token():
     if API_TOKEN:
-        print("Using API token set in script (API_TOKEN).")
         return API_TOKEN
     token = getpass.getpass("Sightline API token (input hidden): ").strip()
     if not token:
@@ -175,8 +174,6 @@ def get_device_rates(session, mitigation_id):
 
     ranked_devices.sort(key=lambda d: d["pps"], reverse=True)
 
-    print("Enumerating full TMS group membership to check for devices "
-          "missing from the traffic-rate data...")
     tms_group_id = get_mitigation_tms_group(session, mitigation_id)
     all_device_ids = get_all_group_device_ids(session, tms_group_id)
 
